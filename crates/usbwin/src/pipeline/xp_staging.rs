@@ -137,9 +137,11 @@ pub fn stage_root_boot_files(usb_mount: &Path, i386: &Path) -> Result<()> {
 /// literal byte-compare against this string when scanning the FAT root
 /// directory, so changing the bytes changes what file it loads.
 ///
-/// Works against any FAT32 NT5.x PBR variant — bootrec puts the string at
-/// offset 0x1AE, ms-sys at offset 368, others elsewhere. We search rather
-/// than assume an offset.
+/// Fallback for the `--boot-record=ms-sys` path only: ms-sys's --fat32nt
+/// embeds the filename at offset 0x170 in sector 0, so the patch is
+/// reachable from a single-sector BOOTSECT.DAT load. mkmsbr's multi-sector
+/// NTLDR PBR puts it in stage 2 (unreachable); that backend uses the
+/// LBA loader instead (see `build_chain_bootsect_via_lba`).
 pub fn build_bootsect_dat(pbr_sector0: &[u8]) -> Result<Vec<u8>> {
     if pbr_sector0.len() < 512 {
         bail!(
@@ -157,13 +159,10 @@ pub fn build_bootsect_dat(pbr_sector0: &[u8]) -> Result<Vec<u8>> {
         .position(|w| w == NTLDR_PADDED)
         .ok_or_else(|| {
             anyhow!(
-                "NTLDR filename string not found in sector 0 of the PBR. \
-                 This PBR variant doesn't embed the filename in sector 0, \
-                 so the BOOTSECT.DAT mechanism can't redirect it. \
-                 (ms-sys --fat32nt puts it at offset 0x170; bootrec's \
-                 NTLDR multi-sector variant puts it at offset 0x5D0 in \
-                 stage 2 — which is unreachable from a single-sector \
-                 BOOTSECT.DAT load.)"
+                "NTLDR filename string not found in sector 0 of the PBR — \
+                 this PBR variant doesn't embed it in sector 0. \
+                 Use the LBA-based loader (build_chain_bootsect_via_lba) \
+                 for this backend."
             )
         })?;
     let mut out = sector0.to_vec();
@@ -172,18 +171,12 @@ pub fn build_bootsect_dat(pbr_sector0: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Produce a single-sector BOOTSECT.DAT by walking FAT to find `$LDR$`,
-/// coalescing its LBAs into runs, and asking bootrec for a raw-LBA loader.
+/// coalescing its LBAs into runs, and asking mkmsbr for a raw-LBA loader.
 ///
-/// This is the *correct* BOOTSECT.DAT generator (works against any PBR
-/// variant since it doesn't rely on the PBR embedding the NTLDR filename
-/// in sector 0). The older `build_bootsect_dat(pbr_sector0)` patcher
-/// stays as a fallback for the ms-sys PBR path until this becomes
-/// universal.
-///
-/// Currently **blocked on `bootrec::build_xp_setup_chain_bootsect`** —
-/// see bootrec/docs/XP_SETUP_CHAIN_BOOTSECT_SPEC.md. Once that ships,
-/// uncomment the marked line and delete the `bail!`. Everything else
-/// (FAT walk, run coalesce, file extent → runs) is wired up and tested.
+/// Universal: works against any PBR variant since it doesn't rely on the
+/// PBR embedding the NTLDR filename in sector 0. The PBR-patch
+/// `build_bootsect_dat` stays as a fallback for the ms-sys PBR path
+/// (which already happens to embed the filename in sector 0).
 pub fn build_chain_bootsect_via_lba(
     partition_device: &mut dyn Device,
 ) -> Result<Vec<u8>> {
@@ -232,73 +225,6 @@ pub fn build_chain_bootsect_via_lba(
     bootrec::build_xp_setup_chain_bootsect(sector0_arr, target_segment, &bootrec_runs)
         .map(|arr| arr.to_vec())
         .map_err(|e| anyhow!("bootrec::build_xp_setup_chain_bootsect: {e}"))
-}
-
-/// Byte-patch `$LDR$` so setupldr looks for its source files in `\I386\`
-/// instead of `\$WIN_NT$.~BT\`.
-///
-/// **Currently unused** — superseded by `replicate_i386_to_bt` which
-/// puts files where setupldr already looks (no setupldr modification).
-/// Kept (with tests) because (a) it's a documented approach that may be
-/// useful for other consumers, and (b) it's the lighter-weight option if
-/// we ever solve the FAT-walker-vs-padded-path interaction that made it
-/// not work in our pipeline.
-#[allow(dead_code)]
-///
-/// When setupldr.bin is loaded via the BOOTSECT.DAT chainload path (as
-/// opposed to a CD-style direct boot), its source-detection logic picks
-/// `\$WIN_NT$.~BT\` as the install-files directory. But our USB has the
-/// I386 tree at `\I386\` (the natural XP-ISO layout) and only stages
-/// `BOOTSECT.DAT` in `\$WIN_NT$.~BT\` — so setupldr fails with the
-/// classic "INF file txtsetup.sif is corrupt or missing, status 18".
-///
-/// Patch: replace every literal `$WIN_NT$.~BT` byte sequence (12 bytes)
-/// with `I386` + 8 trailing spaces (4 bytes name + 8 bytes 0x20). Same
-/// length, no offset shifts.
-///
-/// Why spaces and not nulls: empirically, NULL padding produces paths
-/// like `\I386\0\0...\0\0\txtsetup.sif` when setupldr uses fixed-size
-/// memcpy to build the full path. Spaces are tolerated by FAT short-
-/// name matching (trailing spaces in 8.3 names are trimmed for compare)
-/// and by setupldr's path-construction code. This matches gsar's
-/// default replace behavior, which is what the canonical WinSetupFromUSB
-/// patch (jaclaz/wimb, boot-land 2007-2008) actually emits.
-pub fn patch_setupldr_for_i386_lookup(ldr_path: &Path) -> Result<usize> {
-    const NEEDLE: &[u8; 12] = b"$WIN_NT$.~BT";
-    const REPLACEMENT: &[u8; 12] = b"I386        ";
-
-    let mut bytes =
-        std::fs::read(ldr_path).with_context(|| format!("reading {}", ldr_path.display()))?;
-
-    let mut patches = 0usize;
-    let mut pos = 0;
-    while pos + NEEDLE.len() <= bytes.len() {
-        if let Some(rel) = bytes[pos..]
-            .windows(NEEDLE.len())
-            .position(|w| w == &NEEDLE[..])
-        {
-            let abs = pos + rel;
-            bytes[abs..abs + REPLACEMENT.len()].copy_from_slice(REPLACEMENT);
-            patches += 1;
-            pos = abs + REPLACEMENT.len();
-        } else {
-            break;
-        }
-    }
-
-    if patches == 0 {
-        bail!(
-            "no occurrences of $WIN_NT$.~BT found in {} — wrong file, or \
-             setupldr from an XP variant that uses a different path \
-             literal? Patch is required for setupldr to locate \\I386\\ \
-             when launched via BOOTSECT.DAT.",
-            ldr_path.display()
-        );
-    }
-
-    std::fs::write(ldr_path, &bytes)
-        .with_context(|| format!("writing patched {}", ldr_path.display()))?;
-    Ok(patches)
 }
 
 /// Mirror the contents of `\I386\` into `\$WIN_NT$.~BT\` on the mounted
@@ -442,45 +368,6 @@ mod tests {
         assert_eq!(patched.len(), 512);
         assert_eq!(&patched[368..379], LDR_PADDED);
         assert_eq!(&patched[510..512], &[0x55, 0xAA]);
-    }
-
-    #[test]
-    fn patch_setupldr_replaces_all_occurrences() {
-        let tmp = std::env::temp_dir().join("usbwin_xp_staging_patch_test.bin");
-        let _ = std::fs::remove_file(&tmp);
-
-        // Synthesize a fake $LDR$ with the string at two known offsets,
-        // plus surrounding junk that must not change.
-        let mut blob = vec![0xCCu8; 200];
-        blob[10..22].copy_from_slice(b"$WIN_NT$.~BT");
-        blob[100..112].copy_from_slice(b"$WIN_NT$.~BT");
-        std::fs::write(&tmp, &blob).unwrap();
-
-        let n = patch_setupldr_for_i386_lookup(&tmp).unwrap();
-        assert_eq!(n, 2, "should patch both occurrences");
-
-        let patched = std::fs::read(&tmp).unwrap();
-        // First 4 bytes of each patched region are "I386", next 8 are spaces.
-        assert_eq!(&patched[10..14], b"I386");
-        assert_eq!(&patched[14..22], b"        ");
-        assert_eq!(&patched[100..104], b"I386");
-        assert_eq!(&patched[104..112], b"        ");
-        // Surrounding bytes unchanged.
-        assert_eq!(&patched[0..10], &[0xCC; 10]);
-        assert_eq!(&patched[22..100], &[0xCC; 78]);
-        assert_eq!(&patched[112..200], &[0xCC; 88]);
-
-        std::fs::remove_file(&tmp).unwrap();
-    }
-
-    #[test]
-    fn patch_setupldr_errors_if_not_found() {
-        let tmp = std::env::temp_dir().join("usbwin_xp_staging_patch_test2.bin");
-        let _ = std::fs::remove_file(&tmp);
-        std::fs::write(&tmp, vec![0xAA; 100]).unwrap();
-        let err = patch_setupldr_for_i386_lookup(&tmp).unwrap_err();
-        assert!(err.to_string().contains("no occurrences"));
-        std::fs::remove_file(&tmp).unwrap();
     }
 
     #[test]

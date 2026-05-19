@@ -1,20 +1,9 @@
 //! Pure byte-producing functions for the MBR + FAT32 PBR. The Windows and
 //! XP pipelines call these to compute the bytes they then hand to
 //! `Device::write_at`. Separated out so golden tests can exercise the
-//! integration with `bootrec` (which `cargo test` re-runs on every bump)
-//! without needing a real USB stick.
-//!
-//! Conventions:
-//!   - "Reserved area" = the formatter-written sectors at the start of the
-//!     partition that the splice preserves the BPB / FSInfo of. For Win 7
-//!     this is 1024 bytes (sector 0 + sector 1); for XP, 512 bytes.
-//!   - All functions are infallible-modulo-input-validation: bootrec is
-//!     the source of truth for byte layout, and any error from it
-//!     propagates with context.
-//!
-//! Why not just call bootrec inline from windows.rs / windows_xp.rs?
-//! Decoupling the byte production from the I/O makes golden testing
-//! tractable. The actual write-to-device still lives in the pipeline.
+//! integration with mkmsbr (which `cargo test` re-runs on every bump)
+//! without needing a real USB stick. The actual write-to-device still
+//! lives in the pipeline.
 
 use anyhow::{anyhow, Result};
 
@@ -27,21 +16,6 @@ pub fn build_mbr_win7(disk_size_bytes: u64) -> Result<Vec<u8>> {
     bootrec::mbr_win7(disk_sectors)
         .map(|arr| arr.to_vec())
         .map_err(|e| anyhow!("bootrec::mbr_win7: {e}"))
-}
-
-/// Win 2000/XP/2003 MBR (sector 0 of the whole disk). 512 bytes.
-/// Layout matches `build_mbr_win7` but the boot code is the XP-era variant.
-///
-/// Currently unused by the pipeline — XP mode also writes MBR_WIN7 because
-/// MBR is OS-agnostic and MBR_WIN7 has end-to-end hardware verification on
-/// the Dell E6410. Kept (and tested) so we can swap back via a one-line
-/// change if MBR_XP ever proves preferable on some target.
-#[allow(dead_code)]
-pub fn build_mbr_xp(disk_size_bytes: u64) -> Result<Vec<u8>> {
-    let disk_sectors = disk_size_bytes / SECTOR_SIZE;
-    bootrec::mbr_xp(disk_sectors)
-        .map(|arr| arr.to_vec())
-        .map_err(|e| anyhow!("bootrec::mbr_xp: {e}"))
 }
 
 /// Win 7+ multi-sector FAT32 PBR (BOOTMGR-loading). Takes the formatter's
@@ -86,10 +60,10 @@ pub fn ensure_embedded_blobs() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! Golden tests. The four functions above (`build_mbr_win7`,
-    //! `build_mbr_xp`, `splice_pbr_bootmgr`, `splice_pbr_ntldr`) are usbwin's
-    //! entire output surface for boot-record bytes — any bootrec bump that
-    //! changes them is caught here, before the next hardware test.
+    //! Golden tests. The three functions above (`build_mbr_win7`,
+    //! `splice_pbr_bootmgr`, `splice_pbr_ntldr`) are usbwin's entire output
+    //! surface for boot-record bytes — any mkmsbr bump that changes them is
+    //! caught here, before the next hardware test.
     //!
     //! Goldens live at `tests/golden/` and are committed. Bootstrap them
     //! (or update after an intentional bootrec change) with:
@@ -211,13 +185,6 @@ mod tests {
         let mbr = build_mbr_win7(DISK_SIZE_64GB).unwrap();
         assert_eq!(mbr.len(), 512, "MBR is exactly one sector");
         compare_or_update("mbr_win7_64gb.bin", &mbr);
-    }
-
-    #[test]
-    fn mbr_xp_matches_golden() {
-        let mbr = build_mbr_xp(DISK_SIZE_64GB).unwrap();
-        assert_eq!(mbr.len(), 512, "MBR is exactly one sector");
-        compare_or_update("mbr_xp_64gb.bin", &mbr);
     }
 
     #[test]

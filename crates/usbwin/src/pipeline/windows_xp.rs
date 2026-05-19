@@ -1,20 +1,18 @@
-//! Windows XP install USB pipeline (v0.3).
+//! Windows XP install USB pipeline.
 //!
 //! Differences vs Win 7+ mode (see windows.rs):
-//!   - Boot records: `ms-sys --mbr` (Win 2000/XP/2003 MBR) + `--fat32nt`
-//!     (NTLDR-loading FAT32 PBR), instead of `--mbr7` / `--fat32pe`.
-//!   - Post-copy SIF modification: edit I386/TXTSETUP.SIF on the USB to
-//!     move USB drivers into [BootBusExtenders.Load] so XP text-mode
-//!     setup recognizes the USB as boot media (the WinSetupFromUSB recipe).
+//!   - PBR loads NTLDR (mkmsbr's FAT32_PBR_NTLDR_MULTI_BOOT or
+//!     ms-sys --fat32nt) instead of bootmgr.
+//!   - TXTSETUP.SIF rewrite moves USB drivers into
+//!     [BootBusExtenders.Load] (the WinSetupFromUSB recipe) so text-mode
+//!     setup keeps the USB as boot media across the reboot.
+//!   - Root-staged \NTLDR + \$LDR$ + \boot.ini + \$WIN_NT$.~BT\BOOTSECT.DAT
+//!     so NTLDR's bootsector-entry mechanism chainloads setupldr.
+//!   - I386/ replicated into \$WIN_NT$.~BT\ — that's where setupldr
+//!     looks when launched via BOOTSECT.DAT.
+//!   - Optional `--xp-waiters` (WaitBT/Wait4UFD) and `--xp-unattended`
+//!     (winnt.sif generator).
 //!   - Default label "WINXP" (vs "WIN7").
-//!
-//! What this does NOT YET do (planned chunks 6-7 per docs/V0.3_WINDOWS_XP.md):
-//!   - WaitBT/Wait4UFD driver injection (`--xp-waiters /path/`)
-//!   - winnt.sif answer file generation (`--xp-unattended`)
-//! Without those, XP install will reach the text-mode setup phase and
-//! complete the first stage. The graphical setup phase may hit a 0x7B
-//! BSOD on hardware that initializes USB late; if you see that, we'll
-//! land chunk 6.
 
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -94,44 +92,21 @@ pub fn run(plan: &WritePlan, info: &DeviceInfo, config: &Config) -> Result<()> {
         write_unattended(&usb_mount, config).context("writing winnt.sif")?;
     }
 
-    // Stage \NTLDR, \NTDETECT.COM, \$LDR$, \boot.ini at the partition root.
-    // Without these, the PBR loads \NTLDR (which isn't there yet — XP ISOs
-    // keep it in \I386\) and boots fail before NTLDR even runs. WinSetupFromUSB
-    // recipe; see pipeline/xp_staging.rs.
     let i386 = xp_staging::find_i386_dir(&usb_mount)?;
     xp_staging::stage_root_boot_files(&usb_mount, &i386)
         .context("staging XP boot files at root")?;
     println!("usbwin: staged NTLDR, NTDETECT.COM, $LDR$, boot.ini at USB root");
 
-    // Replicate \I386\ contents into \$WIN_NT$.~BT\ so the unpatched
-    // setupldr — which defaults to \$WIN_NT$.~BT\ when launched via
-    // BOOTSECT.DAT chainload — finds its source files. The alternative
-    // (byte-patching $LDR$'s $WIN_NT$.~BT literal to "I386" + padding)
-    // was tried 2026-05-19 with both null and space padding; both
-    // produced status-18 ("txtsetup.sif corrupt or missing") because
-    // FAT short-name lookup against the resulting padded path
-    // component doesn't match our \I386\ directory. The copy approach
-    // sidesteps padding/FAT-walker quirks entirely. Cost: ~580 MB
-    // extra on the USB stick; rounds to nothing on a 64 GB device.
+    // setupldr launched via BOOTSECT.DAT looks for its source files under
+    // \$WIN_NT$.~BT\, not \I386\. Replicating is simpler than byte-patching
+    // the install-files path literal in $LDR$ (which interacts poorly with
+    // FAT short-name lookup).
     println!("usbwin: replicating I386 → $WIN_NT$.~BT (~580 MB, fast via ditto)…");
     xp_staging::replicate_i386_to_bt(&usb_mount)
         .context("replicating I386 contents into $WIN_NT$.~BT")?;
     println!("usbwin: replicated I386 → $WIN_NT$.~BT");
 
     diskutil::unmount_disk(&bsd_path).context("unmount before boot records")?;
-
-    // Write the XP-era boot records. Both backends use bootrec's MBR_XP
-    // (already in sector 0 from write_mbr_sector); only the PBR backend
-    // varies. ms-sys's `--mbr` is unused: its XP-era boot code at offset
-    // 0x9b-0xa3 loads DL from [bp+0] (= the active flag, 0x80), hardcoding
-    // drive 0x80 instead of preserving the BIOS-supplied DL. On hardware
-    // where the BIOS doesn't enumerate the USB stick as drive 0x80, the
-    // ms-sys XP MBR reads the wrong drive and reports "Missing operating
-    // system" (verified on Dell E6410, 2026-05-19, byte dumps in
-    // /tmp/xp_mssys_*.hex from that session). bootrec's MBR_XP saves DL
-    // before any processing and works on the same hardware. The MBR's
-    // job is OS-agnostic (chainload the active partition's PBR), so
-    // using bootrec's MBR for the ms-sys PBR path is correct.
     diskutil::unmount_disk_force(&bsd_path)
         .context("force-unmount before PBR write")?;
     match config.boot_record_impl {
@@ -142,87 +117,53 @@ pub fn run(plan: &WritePlan, info: &DeviceInfo, config: &Config) -> Result<()> {
         }
         BootRecordImpl::Bootrec => {
             splice_ntldr_pbr(&partition_raw, &info.model, config.verify)
-                .context("bootrec FAT32 NTLDR PBR splice")?;
+                .context("mkmsbr FAT32 NTLDR PBR splice")?;
         }
     }
 
-    // Generate \$WIN_NT$.~BT\BOOTSECT.DAT. Two strategies, tried in order:
+    // Generate \$WIN_NT$.~BT\BOOTSECT.DAT.
     //
-    //  (1) Raw-LBA loader via bootrec primitive (preferred). usbwin walks
-    //      FAT to find $LDR$'s LBAs, asks bootrec to emit a 512-byte loader
-    //      that CHS-reads them and jumps. Works against any PBR variant.
-    //      Blocked on bootrec::build_xp_setup_chain_bootsect — currently
-    //      returns Err so we fall through.
-    //
-    //  (2) Patch a copy of the on-disk PBR: replace the 11-byte NTLDR
-    //      filename with $LDR$. Works for ms-sys's --fat32nt PBR (NTLDR
-    //      string in sector 0). Fails for bootrec's NTLDR multi-sector PBR
-    //      (string in stage 2 / sector 2, unreachable).
-    //
-    // If both fail: log a loud warning and skip the file. NTLDR's boot.ini
-    // menu still renders; selecting the text-mode entry falls through to
-    // the default Windows-load path and shows '<Windows root>\\system32
-    // \\hal.dll missing'. Useful intermediate state for debugging.
+    //   - Primary: raw-LBA $LDR$ loader (mkmsbr::build_xp_setup_chain_bootsect).
+    //     Walks FAT to find $LDR$'s LBAs and emits a 512-byte loader that
+    //     CHS-reads them and jumps. Works against any PBR variant.
+    //   - Fallback: byte-patch a copy of sector 0 of the PBR
+    //     (NTLDR→$LDR$). Only reachable when the PBR embeds the NTLDR
+    //     filename in sector 0, i.e. with `--boot-record=ms-sys`.
     let (bootsect_dat, bootsect_source) = {
         let mut dev = RawDevice::open(&partition_raw, OpenMode::ReadOnly, &info.model)
             .with_context(|| format!("opening {partition_raw} for BOOTSECT.DAT generation"))?;
         let lba_attempt = xp_staging::build_chain_bootsect_via_lba(&mut dev);
         drop(dev);
         match lba_attempt {
-            Ok(bytes) => (Ok(bytes), "raw-LBA $LDR$ loader (bootrec primitive)"),
+            Ok(bytes) => (bytes, "raw-LBA $LDR$ loader"),
             Err(lba_err) => {
                 let pbr_bytes = read_pbr_sector0(&partition_raw, &info.model)
                     .context("reading PBR back for BOOTSECT.DAT fallback")?;
-                let attempt = xp_staging::build_bootsect_dat(&pbr_bytes).map_err(|patch_err| {
+                let bytes = xp_staging::build_bootsect_dat(&pbr_bytes).map_err(|patch_err| {
                     anyhow!(
                         "both BOOTSECT.DAT strategies failed:\n  \
                          raw-LBA path: {lba_err:#}\n  \
                          PBR-patch path: {patch_err:#}"
                     )
-                });
-                (attempt, "PBR-patch fallback (NTLDR→$LDR$ replace)")
+                })?;
+                (bytes, "PBR-patch fallback (NTLDR→$LDR$)")
             }
         }
     };
 
-    // Re-mount to write the file (or to leave it absent), then unmount.
     diskutil::mount_disk(&bsd_path)
         .context("re-mount to write BOOTSECT.DAT")?;
     let usb_mount2 = find_mount_for_label(&plan.label).ok_or_else(|| {
         anyhow!("re-mounted partition didn't reappear in /Volumes")
     })?;
-    match bootsect_dat {
-        Ok(bytes) => {
-            xp_staging::write_bootsect_dat(&usb_mount2, &bytes)
-                .context("writing $WIN_NT$.~BT/BOOTSECT.DAT")?;
-            println!(
-                "usbwin: wrote {}/$WIN_NT$.~BT/BOOTSECT.DAT ({} bytes, {})",
-                usb_mount2.display(),
-                bytes.len(),
-                bootsect_source,
-            );
-        }
-        Err(e) => {
-            eprintln!();
-            eprintln!("usbwin: WARNING — BOOTSECT.DAT not generated:");
-            eprintln!("    {e:#}");
-            eprintln!(
-                "usbwin: NTLDR boot.ini menu will render, but selecting \
-                 'text mode setup'"
-            );
-            eprintln!(
-                "        will fall through to the default Windows load path \
-                 and fail with"
-            );
-            eprintln!(
-                "        '<Windows root>\\\\system32\\\\hal.dll missing'. \
-                 Use --boot-record=ms-sys"
-            );
-            eprintln!("        for a working BOOTSECT.DAT, or wait for bootrec's");
-            eprintln!("        single-sector $LDR$ chainloader primitive.");
-            eprintln!();
-        }
-    }
+    xp_staging::write_bootsect_dat(&usb_mount2, &bootsect_dat)
+        .context("writing $WIN_NT$.~BT/BOOTSECT.DAT")?;
+    println!(
+        "usbwin: wrote {}/$WIN_NT$.~BT/BOOTSECT.DAT ({} bytes, {})",
+        usb_mount2.display(),
+        bootsect_dat.len(),
+        bootsect_source,
+    );
 
     let _ = diskutil::unmount_disk(&bsd_path);
     diskutil::eject(&bsd_path).context("eject after write")?;
@@ -328,14 +269,10 @@ fn read_pbr_sector0(partition_raw: &str, model: &str) -> Result<Vec<u8>> {
 }
 
 fn write_mbr_sector(info: &DeviceInfo) -> Result<()> {
-    // Use the Win 7 MBR variant even in XP mode. The MBR's job is
-    // OS-agnostic (find active partition, chainload its PBR), and
-    // MBR_WIN7 is the bytes that boot end-to-end on the Dell E6410
-    // reference rig (verified 2026-05-19 for Win 7). MBR_XP's PBR
-    // chainload completes on the same hardware too (we saw bootrec's
-    // PBR diagnostic print '2'), but if any downstream stage depends
-    // on MBR side-effects (segment-register state, DL convention,
-    // disk-signature presence), Win7's MBR is the known-quantity.
+    // MBR is OS-agnostic (find active partition, chainload its PBR);
+    // MBR_WIN7 has the most thorough hardware verification, so we use
+    // it for both modes. mkmsbr ships MBR_XP too but it's currently
+    // unused.
     let mbr = boot_records::build_mbr_win7(info.size_bytes)?;
     let mut dev = RawDevice::open(&info.path, OpenMode::ReadWrite, &info.model)
         .context("opening whole disk for MBR write")?;
